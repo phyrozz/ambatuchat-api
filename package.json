@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "scripts": { "deploy": "serverless deploy" },
+  "devDependencies": { "serverless": "^4.0.0" }
+}

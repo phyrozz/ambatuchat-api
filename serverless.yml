@@ -1,0 +1,88 @@
+service: ambatu-chat
+frameworkVersion: '4'
+
+package:
+  patterns:
+    - '!node_modules/**'
+    - '!__pycache__/**'
+    - '!*.md'
+    - '!*.ps1'
+    - '!package*.json'
+
+provider:
+  name: aws
+  region: ${opt:region, 'ap-southeast-1'}
+  runtime: python3.12
+  stage: ${opt:stage, 'prod'}
+  architecture: arm64
+  environment:
+    CHAT_TABLE: !Ref ChatTable
+    CHAT_BUCKET: !Ref ChatMedia
+    PLAYER_POOL_ID: ${env:PLAYER_POOL_ID}
+    WEBSOCKET_ENDPOINT: ${env:WEBSOCKET_ENDPOINT}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query, dynamodb:UpdateItem, dynamodb:DeleteItem]
+          Resource:
+            - !GetAtt ChatTable.Arn
+            - !Sub '${ChatTable.Arn}/index/*'
+        - Effect: Allow
+          Action: [s3:PutObject, s3:GetObject]
+          Resource: !Sub '${ChatMedia.Arn}/chat/*'
+        - Effect: Allow
+          Action: execute-api:ManageConnections
+          Resource: ${env:WEBSOCKET_MANAGE_ARN}
+        - Effect: Allow
+          Action: cognito-idp:ListUsers
+          Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${env:PLAYER_POOL_ID}'
+
+functions:
+  connect:
+    name: ${self:service}-${sls:stage}-connect
+    handler: handler.connect
+  disconnect:
+    name: ${self:service}-${sls:stage}-disconnect
+    handler: handler.disconnect
+  action:
+    name: ${self:service}-${sls:stage}-action
+    handler: handler.action
+
+resources:
+  Resources:
+    ChatTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: pk, AttributeType: S }
+          - { AttributeName: sk, AttributeType: S }
+          - { AttributeName: userId, AttributeType: S }
+        KeySchema:
+          - { AttributeName: pk, KeyType: HASH }
+          - { AttributeName: sk, KeyType: RANGE }
+        TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+        GlobalSecondaryIndexes:
+          - IndexName: ConnectionByUser
+            KeySchema:
+              - { AttributeName: userId, KeyType: HASH }
+              - { AttributeName: pk, KeyType: RANGE }
+            Projection: { ProjectionType: KEYS_ONLY }
+    ChatMedia:
+      Type: AWS::S3::Bucket
+      Properties:
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders: ['*']
+              AllowedMethods: [PUT, GET]
+              AllowedOrigins: ['*']
+              MaxAge: 300
+  Outputs:
+    ChatTableName: { Value: !Ref ChatTable }
+    ChatBucketName: { Value: !Ref ChatMedia }

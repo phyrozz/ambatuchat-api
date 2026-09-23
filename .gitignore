@@ -1,0 +1,7 @@
+__pycache__
+.serverless
+*.zip
+node_modules
+package-lock.json
+.env
+*.env
