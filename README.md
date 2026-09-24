@@ -16,4 +16,8 @@ Presigned media URLs are generated against the bucket's regional S3 endpoint. If
 
 Chat restrictions are stored as `CHAT_RESTRICTION#<Cognito sub>` items in the chat table. The action Lambda checks this item before creating a conversation, issuing an upload URL, or sending a message. Restricted players can still read conversations and report abuse. The admin app uses `dynamodb:UpdateItem` to restrict and unrestrict players; the action Lambda already has `dynamodb:GetItem`. Redeploy this service after updating the handler.
 
+Message history is returned newest first by DynamoDB in pages of 50, then ordered oldest to newest in the response. Clients pass the returned `nextCursor` to the `history` action to load earlier messages until it is `null`.
+
+Message reactions use the `react` WebSocket action and are stored on each message as one emoji per player. Calling `react` with the same emoji removes it; another emoji replaces it. The action broadcasts the updated reaction map to everyone in the conversation. The picker and Lambda validate against Unicode Emoji 18.0, generated from [Unicode's emoji-test.txt](https://www.unicode.org/Public/emoji/latest/emoji-test.txt). To update both catalogs, download that file and run `python tools/generate-chat-emojis.py path/to/emoji-test.txt` from the workspace root. Redeploy this service to install the new `react` route and Lambda code.
+
 The table uses on demand billing. Before production, set CloudWatch alarms, retention, and S3 lifecycle policies appropriate to your moderation policy. The current report workflow records reports and lets admins resolve them; it does not automatically remove reported messages.

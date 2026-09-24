@@ -25,6 +25,8 @@ cognito = boto3.client('cognito-idp')
 gateway = boto3.client('apigatewaymanagementapi', endpoint_url=os.environ['WEBSOCKET_ENDPOINT'])
 with open(os.path.join(os.path.dirname(__file__), 'sound-ids.json'), encoding='utf-8') as sound_ids_file:
     SOUND_IDS = frozenset(json.load(sound_ids_file))
+with open(os.path.join(os.path.dirname(__file__), 'emoji-list.json'), encoding='utf-8') as emoji_file:
+    EMOJI = frozenset(json.load(emoji_file))
 bucket = os.environ['CHAT_BUCKET']
 
 
@@ -82,9 +84,15 @@ def ensure_chat_allowed(user):
 
 def public_message(item):
     output = {key: item[key] for key in ('id', 'conversationId', 'senderId', 'kind', 'text', 'key', 'createdAt') if key in item}
+    output['messageKey'] = item['sk']
+    output['reactions'] = message_reactions(item)
     if output.get('key'):
         output['url'] = s3.generate_presigned_url('get_object', Params={'Bucket': bucket, 'Key': output['key']}, ExpiresIn=3600)
     return output
+
+
+def message_reactions(item):
+    return {key.removeprefix('reaction_'): value for key, value in item.items() if key.startswith('reaction_') and isinstance(value, str)}
 
 
 def authenticate(connection, body):
@@ -147,8 +155,14 @@ def history(user, body):
     conversation = str(body.get('conversation', ''))
     if not member(conversation, user):
         raise ValueError('Conversation not found.')
-    result = ddb.query(KeyConditionExpression=Key('pk').eq(f'CONV#{conversation}') & Key('sk').begins_with('MSG#'), ScanIndexForward=False, Limit=50)
-    return {'conversation': conversation, 'messages': [public_message(item) for item in reversed(result['Items'])]}
+    cursor = body.get('cursor')
+    if cursor is not None and (not isinstance(cursor, str) or not re.fullmatch(r'MSG#\d{13}#[a-f0-9]{32}', cursor)):
+        raise ValueError('Invalid message cursor.')
+    query = {'KeyConditionExpression': Key('pk').eq(f'CONV#{conversation}') & Key('sk').begins_with('MSG#'), 'ScanIndexForward': False, 'Limit': 50}
+    if cursor:
+        query['ExclusiveStartKey'] = {'pk': f'CONV#{conversation}', 'sk': cursor}
+    result = ddb.query(**query)
+    return {'conversation': conversation, 'messages': [public_message(item) for item in reversed(result['Items'])], 'nextCursor': result.get('LastEvaluatedKey', {}).get('sk')}
 
 
 def media_upload(user, body):
@@ -202,6 +216,45 @@ def send(user, body):
     return {'message': message}
 
 
+def react(user, body):
+    conversation = str(body.get('conversation', ''))
+    membership = member(conversation, user)
+    if not membership:
+        raise ValueError('Conversation not found.')
+    message_key = body.get('messageKey')
+    emoji = body.get('emoji')
+    if not isinstance(message_key, str) or not re.fullmatch(r'MSG#\d{13}#[a-f0-9]{32}', message_key):
+        raise ValueError('Invalid message.')
+    if not isinstance(emoji, str) or emoji not in EMOJI:
+        raise ValueError('Choose an emoji.')
+    key = {'pk': f'CONV#{conversation}', 'sk': message_key}
+    reaction_name = f'reaction_{user}'
+    for _ in range(3):
+        item = ddb.get_item(Key=key, ConsistentRead=True).get('Item')
+        if not item:
+            raise ValueError('Message not found.')
+        previous = item.get(reaction_name)
+        try:
+            if previous == emoji:
+                updated = ddb.update_item(Key=key, UpdateExpression='REMOVE #reaction', ConditionExpression='attribute_exists(pk) AND #reaction = :previous', ExpressionAttributeNames={'#reaction': reaction_name}, ExpressionAttributeValues={':previous': previous}, ReturnValues='ALL_NEW')['Attributes']
+            else:
+                condition = 'attribute_exists(pk) AND #reaction = :previous' if previous else 'attribute_exists(pk) AND attribute_not_exists(#reaction)'
+                values = {':emoji': emoji, **({':previous': previous} if previous else {})}
+                updated = ddb.update_item(Key=key, UpdateExpression='SET #reaction = :emoji', ConditionExpression=condition, ExpressionAttributeNames={'#reaction': reaction_name}, ExpressionAttributeValues=values, ReturnValues='ALL_NEW')['Attributes']
+            reactions = message_reactions(updated)
+            event = {'event': 'reaction', 'conversationId': conversation, 'messageKey': message_key, 'reactions': reactions}
+            for member_id in membership['members']:
+                sockets = ddb.query(IndexName='ConnectionByUser', KeyConditionExpression=Key('userId').eq(member_id))['Items']
+                for socket in sockets:
+                    if socket['pk'].startswith('CONN#'):
+                        push(socket['pk'][5:], event)
+            return {'messageKey': message_key, 'reactions': reactions}
+        except ClientError as error:
+            if error.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                raise
+    raise ValueError('Could not update reaction. Try again.')
+
+
 def report(user, body):
     conversation = str(body.get('conversation', ''))
     if not member(conversation, user):
@@ -234,9 +287,9 @@ def action(event, _context):
             data = authenticate(connection, body)
         else:
             user = socket_user(connection)
-            if route in ('createConversation', 'mediaUpload', 'send'):
+            if route in ('createConversation', 'mediaUpload', 'send', 'react'):
                 ensure_chat_allowed(user)
-            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'history': lambda: history(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'report': lambda: report(user, body)}
+            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'history': lambda: history(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'report': lambda: report(user, body)}
             if route not in routes:
                 raise ValueError('Unknown chat action.')
             data = routes[route]()
