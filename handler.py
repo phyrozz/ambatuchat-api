@@ -128,6 +128,27 @@ def conversations(user):
     return {'conversations': [clean(item) for item in result['Items']]}
 
 
+def set_conversation_mute(user, body):
+    conversation = str(body.get('conversation', ''))
+    muted = body.get('muted')
+    if type(muted) is not bool:
+        raise ValueError('Choose whether to mute this conversation.')
+    record = member(conversation, user)
+    if not record:
+        raise ValueError('Conversation not found.')
+    ddb.update_item(
+        Key={'pk': f'USER#{user}', 'sk': f'CONV#{conversation}'},
+        UpdateExpression='SET muted = :muted',
+        ConditionExpression='attribute_exists(pk)',
+        ExpressionAttributeValues={':muted': muted},
+    )
+    sockets = ddb.query(IndexName='ConnectionByUser', KeyConditionExpression=Key('userId').eq(user))['Items']
+    for socket in sockets:
+        if socket['pk'].startswith('CONN#'):
+            push(socket['pk'][5:], {'event': 'conversation', 'conversationId': conversation})
+    return {'conversation': conversation, 'muted': muted}
+
+
 def encoded(values):
     return {key: serializer.serialize(value) for key, value in values.items()}
 
@@ -330,6 +351,11 @@ def send(user, body):
     key = body.get('key', '')
     if kind == 'text' and not 0 < len(text) <= 2000:
         raise ValueError('Enter a message up to 2000 characters.')
+    mentions = body.get('mentions', [])
+    if not isinstance(mentions, list):
+        mentions = []
+    valid_members = set(membership.get('members', [])) - {user} if membership.get('group') else set()
+    mentions = list(dict.fromkeys(item for item in mentions if isinstance(item, str) and item in valid_members))[:25]
     if kind == 'gif':
         url = urlparse(text)
         if url.scheme != 'https' or url.hostname not in {'media.giphy.com', 'i.giphy.com', 'media.tenor.com', 'c.tenor.com'} or len(text) > 1000:
@@ -383,6 +409,7 @@ def send(user, body):
                 'groupTitle': membership.get('title', ''),
                 'kind': kind,
                 'text': text if kind == 'text' else '',
+                'mentions': mentions,
             }).encode(),
         )
         print(f'Queued push delivery for {len(recipients)} conversation member(s).')
@@ -436,6 +463,10 @@ def notification_preview(kind, text):
 
 def send_push_notifications(user, conversation, event):
     try:
+        conversation_record = member(conversation, user)
+        if conversation_record and conversation_record.get('muted') is True:
+            print(f'Push delivery skipped for muted conversation {conversation}.')
+            return
         access_token, project = fcm_access_token()
         if not access_token:
             return
@@ -447,11 +478,13 @@ def send_push_notifications(user, conversation, event):
         title = str(event.get('groupTitle') or '').strip() if is_group else sender_name
         if not title:
             title = 'New message'
+        is_mentioned = user in event.get('mentions', [])
         body = f'{sender_name}: {preview}' if is_group and sender_name else preview
         for device in devices:
+            device_body = f'{sender_name} mentioned you: {preview}' if is_mentioned and sender_name else body
             payload = json.dumps({'message': {
                 'token': device['token'],
-                'notification': {'title': title, 'body': body},
+                'notification': {'title': title, 'body': device_body},
                 'data': {'conversationId': conversation, 'url': f'/chat/?conversation={conversation}'},
                 'webpush': {'data': {'conversationId': conversation}, 'fcm_options': {'link': f"{os.environ['WEB_APP_URL'].rstrip('/')}/chat/?conversation={conversation}"} if os.environ.get('WEB_APP_URL') else {}, 'notification': {'icon': '/app-icon.svg', 'tag': f'chat-{conversation}'}},
                 'android': {'notification': {'channel_id': 'messages', 'tag': f'chat-{conversation}'}},
@@ -582,7 +615,7 @@ def action(event, _context):
             user = socket_user(connection)
             if route in ('createConversation', 'addGroupMember', 'createGroupInvite', 'acceptGroupInvite', 'mediaUpload', 'send', 'react') or (route == 'removeGroupMember' and body.get('userId') != user):
                 ensure_chat_allowed(user)
-            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'addGroupMember': lambda: group_membership(user, body, True), 'removeGroupMember': lambda: group_membership(user, body, False), 'createGroupInvite': lambda: create_group_invite(user, body), 'previewGroupInvite': lambda: group_invite(user, body, False), 'acceptGroupInvite': lambda: group_invite(user, body, True), 'history': lambda: history(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'report': lambda: report(user, body), 'registerPush': lambda: register_push(user, body, True), 'unregisterPush': lambda: register_push(user, body, False)}
+            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'addGroupMember': lambda: group_membership(user, body, True), 'removeGroupMember': lambda: group_membership(user, body, False), 'createGroupInvite': lambda: create_group_invite(user, body), 'previewGroupInvite': lambda: group_invite(user, body, False), 'acceptGroupInvite': lambda: group_invite(user, body, True), 'history': lambda: history(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'setMute': lambda: set_conversation_mute(user, body), 'report': lambda: report(user, body), 'registerPush': lambda: register_push(user, body, True), 'unregisterPush': lambda: register_push(user, body, False)}
             if route not in routes:
                 raise ValueError('Unknown chat action.')
             data = routes[route]()
