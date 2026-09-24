@@ -5,6 +5,9 @@ import os
 import re
 import time
 import uuid
+import hashlib
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from decimal import Decimal
 from urllib.parse import urlparse
 
@@ -32,6 +35,9 @@ with open(os.path.join(os.path.dirname(__file__), 'emoji-list.json'), encoding='
     EMOJI = frozenset(json.load(emoji_file))
 bucket = os.environ['CHAT_BUCKET']
 cleanup_lambda = boto3.client('lambda')
+push_lambda = boto3.client('lambda')
+secrets = boto3.client('secretsmanager')
+_fcm_credentials = None
 
 
 def now():
@@ -363,7 +369,85 @@ def send(user, body):
         for socket in sockets:
             if socket['pk'].startswith('CONN#'):
                 push(socket['pk'][5:], {'event': 'message', 'message': message})
+    recipients = [recipient for recipient in membership['members'] if recipient != user]
+    if recipients and os.environ.get('FCM_PROJECT_ID') and os.environ.get('FCM_SECRET_ARN'):
+        push_lambda.invoke(
+            FunctionName=os.environ['PUSH_FUNCTION_NAME'], InvocationType='Event',
+            Payload=json.dumps({'users': recipients, 'conversation': conversation}).encode(),
+        )
     return {'message': message}
+
+
+def register_push(user, body, adding):
+    token = body.get('token')
+    platform = body.get('platform')
+    locale = body.get('locale', 'en')
+    if not isinstance(token, str) or not 20 <= len(token) <= 4096 or not isinstance(platform, str) or platform not in ('android', 'ios', 'web') or locale not in ('en', 'id'):
+        raise ValueError('Invalid push registration.')
+    key = {'pk': f'PUSH#{user}', 'sk': f'TOKEN#{hashlib.sha256(token.encode()).hexdigest()}'}
+    if adding:
+        ddb.put_item(Item={**key, 'token': token, 'platform': platform, 'locale': locale, 'updatedAt': now()})
+    else:
+        ddb.delete_item(Key=key)
+    return {'registered': adding}
+
+
+def fcm_access_token():
+    global _fcm_credentials
+    if not _fcm_credentials:
+        arn = os.environ.get('FCM_SECRET_ARN')
+        project = os.environ.get('FCM_PROJECT_ID')
+        if not arn or not project:
+            return None, None
+        secret = json.loads(secrets.get_secret_value(SecretId=arn)['SecretString'])
+        from google.auth.transport.requests import Request as GoogleRequest
+        from google.oauth2 import service_account
+        _fcm_credentials = service_account.Credentials.from_service_account_info(secret, scopes=['https://www.googleapis.com/auth/firebase.messaging'])
+        _fcm_credentials.refresh(GoogleRequest())
+    elif not _fcm_credentials.valid or _fcm_credentials.expired:
+        from google.auth.transport.requests import Request as GoogleRequest
+        _fcm_credentials.refresh(GoogleRequest())
+    return _fcm_credentials.token, os.environ['FCM_PROJECT_ID']
+
+
+def send_push_notifications(user, conversation):
+    try:
+        access_token, project = fcm_access_token()
+        if not access_token:
+            return
+        devices = ddb.query(KeyConditionExpression=Key('pk').eq(f'PUSH#{user}') & Key('sk').begins_with('TOKEN#')).get('Items', [])
+        for device in devices:
+            locale = device.get('locale', 'en')
+            title = {'en': 'New message', 'id': 'New message'}.get(locale, 'New message')
+            body = {'en': 'You have a new message.', 'id': 'You have a new message.'}.get(locale, 'You have a new message.')
+            payload = json.dumps({'message': {
+                'token': device['token'],
+                'notification': {'title': title, 'body': body},
+                'data': {'conversationId': conversation, 'url': f'/chat/?conversation={conversation}'},
+                'webpush': {'data': {'conversationId': conversation}, 'fcm_options': {'link': f"{os.environ['WEB_APP_URL'].rstrip('/')}/chat/?conversation={conversation}"} if os.environ.get('WEB_APP_URL') else {}, 'notification': {'icon': '/app-icon.svg', 'tag': f'chat-{conversation}'}},
+                'android': {'notification': {'channel_id': 'messages', 'tag': f'chat-{conversation}'}},
+            }}).encode()
+            request = Request(f'https://fcm.googleapis.com/v1/projects/{project}/messages:send', data=payload, headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}, method='POST')
+            try:
+                with urlopen(request, timeout=5):
+                    pass
+            except HTTPError as error:
+                if b'UNREGISTERED' in error.read():
+                    ddb.delete_item(Key={'pk': device['pk'], 'sk': device['sk']})
+                else:
+                    print(f'FCM delivery failed: {error}')
+    except Exception as error:
+        print(f'Push delivery unavailable: {error}')
+
+
+def push_notifications(event, _context):
+    from concurrent.futures import ThreadPoolExecutor
+    users = event.get('users', [])
+    conversation = event.get('conversation', '')
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        tasks = [executor.submit(send_push_notifications, user, conversation) for user in users if isinstance(user, str)]
+        for task in tasks:
+            task.result()
 
 
 def react(user, body):
@@ -469,7 +553,7 @@ def action(event, _context):
             user = socket_user(connection)
             if route in ('createConversation', 'addGroupMember', 'createGroupInvite', 'acceptGroupInvite', 'mediaUpload', 'send', 'react') or (route == 'removeGroupMember' and body.get('userId') != user):
                 ensure_chat_allowed(user)
-            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'addGroupMember': lambda: group_membership(user, body, True), 'removeGroupMember': lambda: group_membership(user, body, False), 'createGroupInvite': lambda: create_group_invite(user, body), 'previewGroupInvite': lambda: group_invite(user, body, False), 'acceptGroupInvite': lambda: group_invite(user, body, True), 'history': lambda: history(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'report': lambda: report(user, body)}
+            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'addGroupMember': lambda: group_membership(user, body, True), 'removeGroupMember': lambda: group_membership(user, body, False), 'createGroupInvite': lambda: create_group_invite(user, body), 'previewGroupInvite': lambda: group_invite(user, body, False), 'acceptGroupInvite': lambda: group_invite(user, body, True), 'history': lambda: history(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'report': lambda: report(user, body), 'registerPush': lambda: register_push(user, body, True), 'unregisterPush': lambda: register_push(user, body, False)}
             if route not in routes:
                 raise ValueError('Unknown chat action.')
             data = routes[route]()

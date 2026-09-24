@@ -46,7 +46,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw 'npm install failed.' }
   npx serverless deploy --stage $Stage --region $Region
   if ($LASTEXITCODE -ne 0) { throw 'Serverless deployment failed.' }
-  $routes = @('$connect', '$disconnect', 'authenticate', 'conversations', 'createConversation', 'addGroupMember', 'removeGroupMember', 'createGroupInvite', 'previewGroupInvite', 'acceptGroupInvite', 'history', 'mediaUpload', 'send', 'react', 'report', '$default')
+  $routes = @('$connect', '$disconnect', 'authenticate', 'conversations', 'createConversation', 'addGroupMember', 'removeGroupMember', 'createGroupInvite', 'previewGroupInvite', 'acceptGroupInvite', 'history', 'mediaUpload', 'send', 'react', 'report', 'registerPush', 'unregisterPush', '$default')
   foreach ($route in $routes) {
     $handler = if ($route -eq '$connect') { 'connect' } elseif ($route -eq '$disconnect') { 'disconnect' } else { 'action' }
     $functionName = "ambatu-chat-$Stage-$handler"

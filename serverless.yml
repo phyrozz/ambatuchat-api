@@ -9,6 +9,10 @@ package:
     - '!*.ps1'
     - '!package*.json'
 
+custom:
+  pythonRequirements:
+    dockerizePip: true
+
 provider:
   name: aws
   region: ${opt:region, 'ap-southeast-1'}
@@ -21,6 +25,10 @@ provider:
     GROUP_CLEANUP_FUNCTION: ${self:service}-${sls:stage}-cleanup
     PLAYER_POOL_ID: ${env:PLAYER_POOL_ID}
     WEBSOCKET_ENDPOINT: ${env:WEBSOCKET_ENDPOINT}
+    FCM_PROJECT_ID: ${env:FCM_PROJECT_ID, ''}
+    FCM_SECRET_ARN: ${env:FCM_SECRET_ARN, ''}
+    WEB_APP_URL: ${env:WEB_APP_URL, ''}
+    PUSH_FUNCTION_NAME: ${self:service}-${sls:stage}-push
   iam:
     role:
       statements:
@@ -34,13 +42,18 @@ provider:
           Resource: !Sub '${ChatMedia.Arn}/chat/*'
         - Effect: Allow
           Action: lambda:InvokeFunction
-          Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${self:service}-${sls:stage}-cleanup'
+          Resource:
+            - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${self:service}-${sls:stage}-cleanup'
+            - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${self:service}-${sls:stage}-push'
         - Effect: Allow
           Action: execute-api:ManageConnections
           Resource: ${env:WEBSOCKET_MANAGE_ARN}
         - Effect: Allow
           Action: cognito-idp:ListUsers
           Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${env:PLAYER_POOL_ID}'
+        - Effect: Allow
+          Action: secretsmanager:GetSecretValue
+          Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ambatu-chat/${self:provider.stage}/fcm-*'
 
 functions:
   connect:
@@ -56,6 +69,10 @@ functions:
     name: ${self:service}-${sls:stage}-cleanup
     handler: handler.cleanup_group
     timeout: 900
+  push:
+    name: ${self:service}-${sls:stage}-push
+    handler: handler.push_notifications
+    timeout: 120
 
 resources:
   Resources:
