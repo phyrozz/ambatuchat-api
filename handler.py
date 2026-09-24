@@ -10,10 +10,13 @@ from urllib.parse import urlparse
 
 import boto3
 from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.types import TypeSerializer
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
 ddb = boto3.resource('dynamodb').Table(os.environ['CHAT_TABLE'])
+ddb_client = boto3.client('dynamodb')
+serializer = TypeSerializer()
 region = os.environ['AWS_REGION']
 s3 = boto3.client(
     's3',
@@ -28,6 +31,7 @@ with open(os.path.join(os.path.dirname(__file__), 'sound-ids.json'), encoding='u
 with open(os.path.join(os.path.dirname(__file__), 'emoji-list.json'), encoding='utf-8') as emoji_file:
     EMOJI = frozenset(json.load(emoji_file))
 bucket = os.environ['CHAT_BUCKET']
+cleanup_lambda = boto3.client('lambda')
 
 
 def now():
@@ -73,7 +77,7 @@ def socket_user(connection):
 
 
 def member(conversation, user):
-    return ddb.get_item(Key={'pk': f'USER#{user}', 'sk': f'CONV#{conversation}'}).get('Item')
+    return ddb.get_item(Key={'pk': f'USER#{user}', 'sk': f'CONV#{conversation}'}, ConsistentRead=True).get('Item')
 
 
 def ensure_chat_allowed(user):
@@ -114,8 +118,141 @@ def authenticate(connection, body):
 
 
 def conversations(user):
-    result = ddb.query(KeyConditionExpression=Key('pk').eq(f'USER#{user}') & Key('sk').begins_with('CONV#'))
+    result = ddb.query(KeyConditionExpression=Key('pk').eq(f'USER#{user}') & Key('sk').begins_with('CONV#'), ConsistentRead=True)
     return {'conversations': [clean(item) for item in result['Items']]}
+
+
+def encoded(values):
+    return {key: serializer.serialize(value) for key, value in values.items()}
+
+
+def group_membership(user, body, adding):
+    conversation = str(body.get('conversation', ''))
+    target = body.get('userId')
+    if not isinstance(target, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', target):
+        raise ValueError('Choose a valid player.')
+    meta_key = {'pk': f'CONV#{conversation}', 'sk': 'META'}
+    meta = ddb.get_item(Key=meta_key, ConsistentRead=True).get('Item')
+    membership = member(conversation, user)
+    if not meta or not meta.get('group') or user not in meta['members'] or not membership:
+        raise ValueError('Group chat not found.')
+    old_members = meta['members']
+    if adding:
+        if target in old_members:
+            raise ValueError('This player is already in the group.')
+        if len(old_members) >= 25:
+            raise ValueError('A group can have up to 25 members.')
+        found = cognito.list_users(UserPoolId=os.environ['PLAYER_POOL_ID'], Filter=f'sub = "{target}"', Limit=1)
+        if not found.get('Users'):
+            raise ValueError('The selected player no longer exists.')
+        name = body.get('name')
+        if not isinstance(name, str) or not name.strip() or len(name) > 40:
+            raise ValueError('Choose a valid player name.')
+        new_members = sorted([*old_members, target])
+        names = {**membership.get('names', {}), target: name.strip()}
+    else:
+        if target not in old_members:
+            raise ValueError('This player is not in the group.')
+        if len(old_members) == 1:
+            if target != user:
+                raise ValueError('Only the last member can leave the group.')
+            cleanup_lambda.invoke(
+                FunctionName=os.environ['GROUP_CLEANUP_FUNCTION'], InvocationType='Event',
+                Payload=json.dumps({'conversation': conversation}).encode(),
+            )
+            ddb_client.transact_write_items(TransactItems=[
+                {'Delete': {
+                    'TableName': os.environ['CHAT_TABLE'], 'Key': encoded(meta_key),
+                    'ConditionExpression': '#members = :old AND #group = :true',
+                    'ExpressionAttributeNames': {'#members': 'members', '#group': 'group'},
+                    'ExpressionAttributeValues': encoded({':old': old_members, ':true': True}),
+                }},
+                {'Delete': {
+                    'TableName': os.environ['CHAT_TABLE'],
+                    'Key': encoded({'pk': f'USER#{user}', 'sk': f'CONV#{conversation}'}),
+                    'ConditionExpression': 'attribute_exists(pk)',
+                }},
+            ])
+            sockets = ddb.query(IndexName='ConnectionByUser', KeyConditionExpression=Key('userId').eq(user))['Items']
+            for socket in sockets:
+                if socket['pk'].startswith('CONN#'):
+                    push(socket['pk'][5:], {'event': 'conversation', 'conversationId': conversation})
+            return {'conversation': conversation, 'members': [], 'names': {}, 'deleted': True}
+        new_members = [item for item in old_members if item != target]
+        # Keep former members' names so their earlier messages remain readable.
+        names = membership.get('names', {})
+    timestamp = now()
+    table = os.environ['CHAT_TABLE']
+    tx = [{'Update': {
+        'TableName': table, 'Key': encoded(meta_key),
+        'UpdateExpression': 'SET #members = :new',
+        'ConditionExpression': '#members = :old AND #group = :true',
+        'ExpressionAttributeNames': {'#members': 'members', '#group': 'group'},
+        'ExpressionAttributeValues': encoded({':new': new_members, ':old': old_members, ':true': True}),
+    }}]
+    for member_id in old_members:
+        if member_id == target and not adding:
+            continue
+        tx.append({'Update': {
+            'TableName': table,
+            'Key': encoded({'pk': f'USER#{member_id}', 'sk': f'CONV#{conversation}'}),
+            'UpdateExpression': 'SET #members = :members, #names = :names',
+            'ConditionExpression': 'attribute_exists(pk)',
+            'ExpressionAttributeNames': {'#members': 'members', '#names': 'names'},
+            'ExpressionAttributeValues': encoded({':members': new_members, ':names': names}),
+        }})
+    target_key = encoded({'pk': f'USER#{target}', 'sk': f'CONV#{conversation}'})
+    if adding:
+        tx.append({'Put': {
+            'TableName': table,
+            'Item': encoded({'pk': f'USER#{target}', 'sk': f'CONV#{conversation}', 'id': conversation, 'members': new_members, 'group': True, 'title': meta['title'], 'names': names, 'updatedAt': timestamp}),
+            'ConditionExpression': 'attribute_not_exists(pk)',
+        }})
+    else:
+        tx.append({'Delete': {'TableName': table, 'Key': target_key, 'ConditionExpression': 'attribute_exists(pk)'}})
+    ddb_client.transact_write_items(TransactItems=tx)
+    for member_id in set([*old_members, *new_members]):
+        sockets = ddb.query(IndexName='ConnectionByUser', KeyConditionExpression=Key('userId').eq(member_id))['Items']
+        for socket in sockets:
+            if socket['pk'].startswith('CONN#'):
+                push(socket['pk'][5:], {'event': 'conversation', 'conversationId': conversation})
+    return {'conversation': conversation, 'members': new_members, 'names': names}
+
+
+def create_group_invite(user, body):
+    conversation = str(body.get('conversation', ''))
+    if not re.fullmatch(r'[a-f0-9]{32}', conversation) or not member(conversation, user):
+        raise ValueError('Group chat not found.')
+    meta = ddb.get_item(Key={'pk': f'CONV#{conversation}', 'sk': 'META'}, ConsistentRead=True).get('Item')
+    if not meta or not meta.get('group') or user not in meta['members']:
+        raise ValueError('Group chat not found.')
+    token = uuid.uuid4().hex
+    expires_at = int(time.time()) + 7 * 24 * 3600
+    ddb.put_item(Item={'pk': f'INVITE#{token}', 'sk': 'META', 'conversationId': conversation, 'createdBy': user, 'ttl': expires_at}, ConditionExpression='attribute_not_exists(pk)')
+    return {'token': token, 'expiresAt': expires_at}
+
+
+def group_invite(user, body, accepting):
+    token = body.get('token')
+    if not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{32}', token):
+        raise ValueError('Invalid group invitation.')
+    invite = ddb.get_item(Key={'pk': f'INVITE#{token}', 'sk': 'META'}, ConsistentRead=True).get('Item')
+    if not invite or invite['ttl'] <= int(time.time()):
+        raise ValueError('This group invitation has expired.')
+    conversation = invite['conversationId']
+    meta = ddb.get_item(Key={'pk': f'CONV#{conversation}', 'sk': 'META'}, ConsistentRead=True).get('Item')
+    if not meta or not meta.get('group'):
+        raise ValueError('This group is no longer available.')
+    details = {'conversation': conversation, 'title': meta['title'], 'memberCount': len(meta['members']), 'alreadyMember': user in meta['members']}
+    if not accepting or details['alreadyMember']:
+        return details
+    if len(meta['members']) >= 25:
+        raise ValueError('This group is full.')
+    name = body.get('name')
+    if not isinstance(name, str) or not name.strip() or len(name) > 40:
+        raise ValueError('Choose a valid player name.')
+    result = group_membership(meta['members'][0], {'conversation': conversation, 'userId': user, 'name': name.strip()}, True)
+    return {**details, 'memberCount': len(result['members']), 'alreadyMember': True}
 
 
 def create_conversation(user, body):
@@ -204,10 +341,23 @@ def send(user, body):
         raise ValueError('Invalid message type.')
     timestamp = now()
     item = {'pk': f'CONV#{conversation}', 'sk': f'MSG#{timestamp:013d}#{uuid.uuid4().hex}', 'id': uuid.uuid4().hex, 'conversationId': conversation, 'senderId': user, 'kind': kind, 'text': text if kind in ('text', 'gif', 'sound') else '', 'key': key if kind in ('image', 'video') else '', 'createdAt': timestamp}
-    ddb.put_item(Item=item)
+    ddb_client.transact_write_items(TransactItems=[
+        {'ConditionCheck': {
+            'TableName': os.environ['CHAT_TABLE'],
+            'Key': encoded({'pk': f'CONV#{conversation}', 'sk': 'META'}),
+            'ConditionExpression': 'contains(#members, :user)',
+            'ExpressionAttributeNames': {'#members': 'members'},
+            'ExpressionAttributeValues': encoded({':user': user}),
+        }},
+        {'Put': {'TableName': os.environ['CHAT_TABLE'], 'Item': encoded(item)}},
+    ])
     message = public_message(item)
     for member_id in membership['members']:
-        ddb.update_item(Key={'pk': f'USER#{member_id}', 'sk': f'CONV#{conversation}'}, UpdateExpression='SET updatedAt=:t, lastMessage=:m', ExpressionAttributeValues={':t': timestamp, ':m': text[:100] if kind in ('text', 'gif') else kind})
+        try:
+            ddb.update_item(Key={'pk': f'USER#{member_id}', 'sk': f'CONV#{conversation}'}, UpdateExpression='SET updatedAt=:t, lastMessage=:m', ConditionExpression='attribute_exists(pk)', ExpressionAttributeValues={':t': timestamp, ':m': text[:100] if kind in ('text', 'gif') else kind})
+        except ClientError as error:
+            if error.response['Error']['Code'] != 'ConditionalCheckFailedException':
+                raise
     for member_id in membership['members']:
         sockets = ddb.query(IndexName='ConnectionByUser', KeyConditionExpression=Key('userId').eq(member_id))['Items']
         for socket in sockets:
@@ -275,6 +425,36 @@ def report(user, body):
     return {'reportId': report_id}
 
 
+def cleanup_group(event, _context):
+    """Remove the message history and media after the final member leaves."""
+    conversation = event.get('conversation', '')
+    if not isinstance(conversation, str) or not re.fullmatch(r'[a-f0-9]{32}', conversation):
+        raise ValueError('Invalid group conversation.')
+    partition = f'CONV#{conversation}'
+    for _ in range(15):
+        if not ddb.get_item(Key={'pk': partition, 'sk': 'META'}, ConsistentRead=True).get('Item'):
+            break
+        time.sleep(1)
+    else:
+        return {'deleted': False}
+    while True:
+        records = ddb.query(
+            KeyConditionExpression=Key('pk').eq(partition) & Key('sk').begins_with('MSG#'),
+            ConsistentRead=True, Limit=100,
+        )['Items']
+        if not records:
+            break
+        media = [{'Key': key} for key in {item.get('key') for item in records} if key and key.startswith('chat/')]
+        if media:
+            result = s3.delete_objects(Bucket=bucket, Delete={'Objects': media, 'Quiet': True})
+            if result.get('Errors'):
+                raise RuntimeError(f'Could not delete chat media: {result["Errors"]}')
+        with ddb.batch_writer() as batch:
+            for item in records:
+                batch.delete_item(Key={'pk': partition, 'sk': item['sk']})
+    return {'deleted': True}
+
+
 def action(event, _context):
     connection = event['requestContext']['connectionId']
     try:
@@ -287,9 +467,9 @@ def action(event, _context):
             data = authenticate(connection, body)
         else:
             user = socket_user(connection)
-            if route in ('createConversation', 'mediaUpload', 'send', 'react'):
+            if route in ('createConversation', 'addGroupMember', 'createGroupInvite', 'acceptGroupInvite', 'mediaUpload', 'send', 'react') or (route == 'removeGroupMember' and body.get('userId') != user):
                 ensure_chat_allowed(user)
-            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'history': lambda: history(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'report': lambda: report(user, body)}
+            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'addGroupMember': lambda: group_membership(user, body, True), 'removeGroupMember': lambda: group_membership(user, body, False), 'createGroupInvite': lambda: create_group_invite(user, body), 'previewGroupInvite': lambda: group_invite(user, body, False), 'acceptGroupInvite': lambda: group_invite(user, body, True), 'history': lambda: history(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'report': lambda: report(user, body)}
             if route not in routes:
                 raise ValueError('Unknown chat action.')
             data = routes[route]()

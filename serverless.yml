@@ -18,19 +18,23 @@ provider:
   environment:
     CHAT_TABLE: !Ref ChatTable
     CHAT_BUCKET: !Ref ChatMedia
+    GROUP_CLEANUP_FUNCTION: ${self:service}-${sls:stage}-cleanup
     PLAYER_POOL_ID: ${env:PLAYER_POOL_ID}
     WEBSOCKET_ENDPOINT: ${env:WEBSOCKET_ENDPOINT}
   iam:
     role:
       statements:
         - Effect: Allow
-          Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query, dynamodb:UpdateItem, dynamodb:DeleteItem]
+          Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem, dynamodb:ConditionCheckItem]
           Resource:
             - !GetAtt ChatTable.Arn
             - !Sub '${ChatTable.Arn}/index/*'
         - Effect: Allow
-          Action: [s3:PutObject, s3:GetObject]
+          Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
           Resource: !Sub '${ChatMedia.Arn}/chat/*'
+        - Effect: Allow
+          Action: lambda:InvokeFunction
+          Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${self:service}-${sls:stage}-cleanup'
         - Effect: Allow
           Action: execute-api:ManageConnections
           Resource: ${env:WEBSOCKET_MANAGE_ARN}
@@ -48,6 +52,10 @@ functions:
   action:
     name: ${self:service}-${sls:stage}-action
     handler: handler.action
+  cleanup:
+    name: ${self:service}-${sls:stage}-cleanup
+    handler: handler.cleanup_group
+    timeout: 900
 
 resources:
   Resources:
