@@ -370,11 +370,26 @@ def send(user, body):
             if socket['pk'].startswith('CONN#'):
                 push(socket['pk'][5:], {'event': 'message', 'message': message})
     recipients = [recipient for recipient in membership['members'] if recipient != user]
-    if recipients and os.environ.get('FCM_PROJECT_ID') and os.environ.get('FCM_SECRET_ARN'):
+    fcm_configured = bool(os.environ.get('FCM_PROJECT_ID') and os.environ.get('FCM_SECRET_ARN'))
+    if recipients and fcm_configured:
+        names = membership.get('names', {})
         push_lambda.invoke(
             FunctionName=os.environ['PUSH_FUNCTION_NAME'], InvocationType='Event',
-            Payload=json.dumps({'users': recipients, 'conversation': conversation}).encode(),
+            Payload=json.dumps({
+                'users': recipients,
+                'conversation': conversation,
+                'senderName': names.get(user, ''),
+                'group': bool(membership.get('group')),
+                'groupTitle': membership.get('title', ''),
+                'kind': kind,
+                'text': text if kind == 'text' else '',
+            }).encode(),
         )
+        print(f'Queued push delivery for {len(recipients)} conversation member(s).')
+    elif not recipients:
+        print('Push delivery skipped: no other conversation members.')
+    else:
+        print('Push delivery skipped: Firebase project or secret ARN is not configured.')
     return {'message': message}
 
 
@@ -410,16 +425,30 @@ def fcm_access_token():
     return _fcm_credentials.token, os.environ['FCM_PROJECT_ID']
 
 
-def send_push_notifications(user, conversation):
+def notification_preview(kind, text):
+    if kind != 'text' or not isinstance(text, str) or not text.strip():
+        return 'You have a new message.'
+    preview = ' '.join(text.split())
+    if len(preview) > 120:
+        preview = preview[:119].rstrip() + '…'
+    return preview
+
+
+def send_push_notifications(user, conversation, event):
     try:
         access_token, project = fcm_access_token()
         if not access_token:
             return
         devices = ddb.query(KeyConditionExpression=Key('pk').eq(f'PUSH#{user}') & Key('sk').begins_with('TOKEN#')).get('Items', [])
+        print(f'Push delivery found {len(devices)} registered device(s).')
+        preview = notification_preview(event.get('kind'), event.get('text', ''))
+        sender_name = str(event.get('senderName') or '').strip()
+        is_group = bool(event.get('group'))
+        title = str(event.get('groupTitle') or '').strip() if is_group else sender_name
+        if not title:
+            title = 'New message'
+        body = f'{sender_name}: {preview}' if is_group and sender_name else preview
         for device in devices:
-            locale = device.get('locale', 'en')
-            title = {'en': 'New message', 'id': 'New message'}.get(locale, 'New message')
-            body = {'en': 'You have a new message.', 'id': 'You have a new message.'}.get(locale, 'You have a new message.')
             payload = json.dumps({'message': {
                 'token': device['token'],
                 'notification': {'title': title, 'body': body},
@@ -430,7 +459,7 @@ def send_push_notifications(user, conversation):
             request = Request(f'https://fcm.googleapis.com/v1/projects/{project}/messages:send', data=payload, headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}, method='POST')
             try:
                 with urlopen(request, timeout=5):
-                    pass
+                    print('FCM accepted a push notification.')
             except HTTPError as error:
                 if b'UNREGISTERED' in error.read():
                     ddb.delete_item(Key={'pk': device['pk'], 'sk': device['sk']})
@@ -445,7 +474,7 @@ def push_notifications(event, _context):
     users = event.get('users', [])
     conversation = event.get('conversation', '')
     with ThreadPoolExecutor(max_workers=8) as executor:
-        tasks = [executor.submit(send_push_notifications, user, conversation) for user in users if isinstance(user, str)]
+        tasks = [executor.submit(send_push_notifications, user, conversation, event) for user in users if isinstance(user, str)]
         for task in tasks:
             task.result()
 

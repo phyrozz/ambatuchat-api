@@ -28,7 +28,7 @@ The table uses on demand billing. Before production, set CloudWatch alarms, rete
 
 ## Message push notifications
 
-Push tokens are stored in the existing chat table under `PUSH#<Cognito sub>` after a signed-in player opts in from the Ambatuchat inbox. After persisting a message, the action Lambda asynchronously invokes the push Lambda for the other conversation members, so FCM delivery does not delay live chat. Notification text never includes message contents. Invalid tokens are removed after FCM reports them as expired. Reactions and group membership updates do not generate notifications.
+Push tokens are stored in the existing chat table under `PUSH#<Cognito sub>` after a signed-in player opts in from the Ambatuchat inbox. After persisting a message, the action Lambda asynchronously invokes the push Lambda for the other conversation members, so FCM delivery does not delay live chat. Text notifications include a preview of up to 120 characters; group notifications include the sender's name and group title. Other message types use a generic preview. Notifications are sent only to other conversation members, not the sender. Invalid tokens are removed after FCM reports them as expired. Reactions and group membership updates do not generate notifications.
 
 Configure Firebase Cloud Messaging before deploying:
 
@@ -38,4 +38,4 @@ Configure Firebase Cloud Messaging before deploying:
 4. For web push, add the deployed website hostname to Firebase's authorized domains and generate a Web Push certificate key pair. Add the Firebase web app config and public VAPID key to `revamp/.env.local` using the `NEXT_PUBLIC_FIREBASE_*` variables in `revamp/.env.example`. Set `NEXT_PUBLIC_APP_URL` to the HTTPS origin used by the website.
 5. Set `FCM_PROJECT_ID`, `FCM_SECRET_ARN` (the Secrets Manager ARN), and `WEB_APP_URL` in the shell used for `deploy.ps1`, then deploy chat-service. Set the same Firebase web app config in the production web build environment and rebuild the web/native app.
 
-The service account JSON is read at runtime from Secrets Manager. The deployment role needs Docker to build the Python `google-auth` dependency for the Lambda's Linux ARM64 runtime. Configure all app credentials before running `npm run cap:sync`; then install the rebuilt app and tap the bell in Ambatuchat to grant permission and register that device. Web push requires HTTPS. On iOS web, visitors must add the site to their Home Screen before enabling notifications.
+The service account JSON is read at runtime from Secrets Manager. The deployment role needs Docker to build the Python `google-auth` and `requests` dependencies for the Lambda's Linux ARM64 runtime. Configure all app credentials before running `npm run cap:sync`; then install the rebuilt app and tap the bell in Ambatuchat to grant permission and register that device. Web push requires HTTPS. On iOS web, visitors must add the site to their Home Screen before enabling notifications.
