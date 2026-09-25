@@ -29,10 +29,9 @@ s3 = boto3.client(
 )
 cognito = boto3.client('cognito-idp')
 gateway = boto3.client('apigatewaymanagementapi', endpoint_url=os.environ['WEBSOCKET_ENDPOINT'])
-with open(os.path.join(os.path.dirname(__file__), 'sound-ids.json'), encoding='utf-8') as sound_ids_file:
-    SOUND_IDS = frozenset(json.load(sound_ids_file))
 with open(os.path.join(os.path.dirname(__file__), 'emoji-list.json'), encoding='utf-8') as emoji_file:
     EMOJI = frozenset(json.load(emoji_file))
+SOUND_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 bucket = os.environ['CHAT_BUCKET']
 cleanup_lambda = boto3.client('lambda')
 push_lambda = boto3.client('lambda')
@@ -360,7 +359,7 @@ def send(user, body):
         url = urlparse(text)
         if url.scheme != 'https' or url.hostname not in {'media.giphy.com', 'i.giphy.com', 'media.tenor.com', 'c.tenor.com'} or len(text) > 1000:
             raise ValueError('Choose a GIF from Giphy or Tenor.')
-    if kind == 'sound' and text not in SOUND_IDS:
+    if kind == 'sound' and (not isinstance(text, str) or not SOUND_ID_PATTERN.fullmatch(text)):
         raise ValueError('Choose a sound from the soundboard.')
     if kind in ('image', 'video'):
         if not isinstance(key, str) or not key.startswith(f'chat/{user}/'):
