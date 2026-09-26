@@ -231,7 +231,7 @@ def group_membership(user, body, adding):
     if adding:
         tx.append({'Put': {
             'TableName': table,
-            'Item': encoded({'pk': f'USER#{target}', 'sk': f'CONV#{conversation}', 'id': conversation, 'members': new_members, 'group': True, 'title': meta['title'], 'names': names, 'updatedAt': timestamp}),
+            'Item': encoded({'pk': f'USER#{target}', 'sk': f'CONV#{conversation}', 'id': conversation, 'members': new_members, 'group': True, 'title': meta['title'], 'names': names, 'updatedAt': timestamp, 'unreadCount': 0}),
             'ConditionExpression': 'attribute_not_exists(pk)',
         }})
     else:
@@ -306,7 +306,7 @@ def create_conversation(user, body):
     timestamp = now()
     ddb.put_item(Item={**meta_key, 'members': members, 'group': is_group, 'title': title, 'createdAt': timestamp}, ConditionExpression='attribute_not_exists(pk)')
     for member_id in members:
-        ddb.put_item(Item={'pk': f'USER#{member_id}', 'sk': f'CONV#{conversation}', 'id': conversation, 'members': members, 'group': is_group, 'title': title, 'names': {key: str(value)[:40] for key, value in names.items() if key in members}, 'updatedAt': timestamp})
+        ddb.put_item(Item={'pk': f'USER#{member_id}', 'sk': f'CONV#{conversation}', 'id': conversation, 'members': members, 'group': is_group, 'title': title, 'names': {key: str(value)[:40] for key, value in names.items() if key in members}, 'updatedAt': timestamp, 'unreadCount': 0})
         sockets = ddb.query(IndexName='ConnectionByUser', KeyConditionExpression=Key('userId').eq(member_id))['Items']
         for socket in sockets:
             if socket['pk'].startswith('CONN#'):
@@ -326,6 +326,32 @@ def history(user, body):
         query['ExclusiveStartKey'] = {'pk': f'CONV#{conversation}', 'sk': cursor}
     result = ddb.query(**query)
     return {'conversation': conversation, 'messages': [public_message(item) for item in reversed(result['Items'])], 'nextCursor': result.get('LastEvaluatedKey', {}).get('sk')}
+
+
+def mark_read(user, body):
+    conversation = str(body.get('conversation', ''))
+    if not member(conversation, user):
+        raise ValueError('Conversation not found.')
+    seen_through = body.get('seenThrough')
+    if not isinstance(seen_through, str) or not re.fullmatch(r'MSG#\d{13}#[a-f0-9]{32}', seen_through):
+        raise ValueError('Invalid read position.')
+    if not ddb.get_item(Key={'pk': f'CONV#{conversation}', 'sk': seen_through}, ConsistentRead=True).get('Item'):
+        raise ValueError('Message not found.')
+    key = {'pk': f'USER#{user}', 'sk': f'CONV#{conversation}'}
+    try:
+        result = ddb.update_item(
+            Key=key,
+            UpdateExpression='SET unreadCount = :zero REMOVE lastUnreadMessageKey',
+            ConditionExpression='attribute_exists(pk) AND (attribute_not_exists(lastUnreadMessageKey) OR lastUnreadMessageKey <= :seen)',
+            ExpressionAttributeValues={':zero': 0, ':seen': seen_through},
+            ReturnValues='ALL_NEW',
+        )
+        return {'conversation': conversation, 'read': True, 'unreadCount': int(result['Attributes'].get('unreadCount', 0))}
+    except ClientError as error:
+        if error.response['Error']['Code'] != 'ConditionalCheckFailedException':
+            raise
+        current = ddb.get_item(Key=key, ConsistentRead=True).get('Item', {})
+        return {'conversation': conversation, 'read': False, 'unreadCount': int(current.get('unreadCount', 0))}
 
 
 def media_upload(user, body):
@@ -372,23 +398,28 @@ def send(user, body):
         raise ValueError('Invalid message type.')
     timestamp = now()
     item = {'pk': f'CONV#{conversation}', 'sk': f'MSG#{timestamp:013d}#{uuid.uuid4().hex}', 'id': uuid.uuid4().hex, 'conversationId': conversation, 'senderId': user, 'kind': kind, 'text': text if kind in ('text', 'gif', 'sound') else '', 'key': key if kind in ('image', 'video') else '', 'createdAt': timestamp}
-    ddb_client.transact_write_items(TransactItems=[
+    transaction = [
         {'ConditionCheck': {
             'TableName': os.environ['CHAT_TABLE'],
             'Key': encoded({'pk': f'CONV#{conversation}', 'sk': 'META'}),
-            'ConditionExpression': 'contains(#members, :user)',
+            'ConditionExpression': '#members = :members',
             'ExpressionAttributeNames': {'#members': 'members'},
-            'ExpressionAttributeValues': encoded({':user': user}),
+            'ExpressionAttributeValues': encoded({':members': membership['members']}),
         }},
         {'Put': {'TableName': os.environ['CHAT_TABLE'], 'Item': encoded(item)}},
-    ])
+    ]
     message = public_message(item)
     for member_id in membership['members']:
-        try:
-            ddb.update_item(Key={'pk': f'USER#{member_id}', 'sk': f'CONV#{conversation}'}, UpdateExpression='SET updatedAt=:t, lastMessage=:m', ConditionExpression='attribute_exists(pk)', ExpressionAttributeValues={':t': timestamp, ':m': text[:100] if kind in ('text', 'gif') else kind})
-        except ClientError as error:
-            if error.response['Error']['Code'] != 'ConditionalCheckFailedException':
-                raise
+        update_expression = 'SET updatedAt=:t, lastMessage=:m, unreadCount=:zero REMOVE lastUnreadMessageKey' if member_id == user else 'SET updatedAt=:t, lastMessage=:m, lastUnreadMessageKey=:messageKey ADD unreadCount :one'
+        values = {':t': timestamp, ':m': text[:100] if kind in ('text', 'gif') else kind, ':zero': 0} if member_id == user else {':t': timestamp, ':m': text[:100] if kind in ('text', 'gif') else kind, ':messageKey': item['sk'], ':one': 1}
+        transaction.append({'Update': {
+            'TableName': os.environ['CHAT_TABLE'],
+            'Key': encoded({'pk': f'USER#{member_id}', 'sk': f'CONV#{conversation}'}),
+            'UpdateExpression': update_expression,
+            'ConditionExpression': 'attribute_exists(pk)',
+            'ExpressionAttributeValues': encoded(values),
+        }})
+    ddb_client.transact_write_items(TransactItems=transaction)
     for member_id in membership['members']:
         sockets = ddb.query(IndexName='ConnectionByUser', KeyConditionExpression=Key('userId').eq(member_id))['Items']
         for socket in sockets:
@@ -614,7 +645,7 @@ def action(event, _context):
             user = socket_user(connection)
             if route in ('createConversation', 'addGroupMember', 'createGroupInvite', 'acceptGroupInvite', 'mediaUpload', 'send', 'react') or (route == 'removeGroupMember' and body.get('userId') != user):
                 ensure_chat_allowed(user)
-            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'addGroupMember': lambda: group_membership(user, body, True), 'removeGroupMember': lambda: group_membership(user, body, False), 'createGroupInvite': lambda: create_group_invite(user, body), 'previewGroupInvite': lambda: group_invite(user, body, False), 'acceptGroupInvite': lambda: group_invite(user, body, True), 'history': lambda: history(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'setMute': lambda: set_conversation_mute(user, body), 'report': lambda: report(user, body), 'registerPush': lambda: register_push(user, body, True), 'unregisterPush': lambda: register_push(user, body, False)}
+            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'addGroupMember': lambda: group_membership(user, body, True), 'removeGroupMember': lambda: group_membership(user, body, False), 'createGroupInvite': lambda: create_group_invite(user, body), 'previewGroupInvite': lambda: group_invite(user, body, False), 'acceptGroupInvite': lambda: group_invite(user, body, True), 'history': lambda: history(user, body), 'markRead': lambda: mark_read(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'setMute': lambda: set_conversation_mute(user, body), 'report': lambda: report(user, body), 'registerPush': lambda: register_push(user, body, True), 'unregisterPush': lambda: register_push(user, body, False)}
             if route not in routes:
                 raise ValueError('Unknown chat action.')
             data = routes[route]()
