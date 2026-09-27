@@ -1,11 +1,15 @@
 param(
-  [Parameter(Mandatory = $true)][string]$ApiId,
+  [string]$ApiId = '',
   [Parameter(Mandatory = $true)][string]$Region,
   [Parameter(Mandatory = $true)][string]$PlayerPoolId,
   [string]$Stage = 'prod',
-  [string]$AwsProfile = ''
+  [string]$AwsProfile = '',
+  [switch]$CreateApi
 )
 $ErrorActionPreference = 'Stop'
+if ($CreateApi -and $ApiId) { throw 'Use either -ApiId or -CreateApi, not both.' }
+if (-not $CreateApi -and -not $ApiId) { throw 'Pass -ApiId or use -CreateApi to create a dedicated WebSocket API.' }
+if ($CreateApi -and $Stage -eq 'prod') { throw '-CreateApi is intended for a non-production stage.' }
 function Get-AwsJsonMaybeMissing {
   param([string[]]$Arguments)
   # Windows PowerShell 5.1 turns AWS CLI stderr into a terminating
@@ -26,9 +30,33 @@ function Get-AwsJsonMaybeMissing {
 $env:AWS_REGION = $Region
 $env:PLAYER_POOL_ID = $PlayerPoolId
 if ($AwsProfile) { $env:AWS_PROFILE = $AwsProfile }
+if ($CreateApi) {
+  $apiName = "ambatu-chat-$Stage"
+  $apiList = aws apigatewayv2 get-apis --region $Region | ConvertFrom-Json
+  if ($LASTEXITCODE -ne 0) { throw 'Could not list API Gateway APIs.' }
+  $matchingApis = @($apiList.Items | Where-Object { $_.Name -eq $apiName -and $_.ProtocolType -eq 'WEBSOCKET' })
+  if ($matchingApis.Count -gt 1) { throw "More than one WebSocket API is named $apiName; pass its API ID with -ApiId instead." }
+  if ($matchingApis.Count -eq 1) {
+    $ApiId = $matchingApis[0].ApiId
+    Write-Host "Reusing dedicated WebSocket API $apiName ($ApiId)."
+  } else {
+    $api = aws apigatewayv2 create-api --name $apiName --protocol-type WEBSOCKET --route-selection-expression '$request.body.action' --region $Region | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $api.ApiId) { throw "Could not create the $apiName WebSocket API." }
+    $ApiId = $api.ApiId
+    Write-Host "Created dedicated WebSocket API $apiName ($ApiId)."
+  }
+}
 $api = aws apigatewayv2 get-api --api-id $ApiId --region $Region | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or $api.ProtocolType -ne 'WEBSOCKET' -or $api.RouteSelectionExpression -ne '$request.body.action') {
   throw 'The API must be a WebSocket API using $request.body.action.'
+}
+if ($Stage -notin @('prod', 'production')) {
+  $apiStages = aws apigatewayv2 get-stages --api-id $ApiId --region $Region | ConvertFrom-Json
+  if ($LASTEXITCODE -ne 0) { throw 'Could not list stages for the selected WebSocket API.' }
+  $otherStages = @($apiStages.Items | Where-Object { $_.StageName -ne $Stage } | ForEach-Object { $_.StageName })
+  if ($otherStages.Count -gt 0) {
+    throw "The selected API already has another stage ($($otherStages -join ', ')); WebSocket routes are shared between stages. Use a dedicated API for $Stage."
+  }
 }
 $env:WEBSOCKET_ENDPOINT = "https://$ApiId.execute-api.$Region.amazonaws.com/$Stage"
 $accountId = aws sts get-caller-identity --query Account --output text --region $Region
