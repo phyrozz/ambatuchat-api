@@ -84,6 +84,7 @@ resources:
           - { AttributeName: pk, AttributeType: S }
           - { AttributeName: sk, AttributeType: S }
           - { AttributeName: userId, AttributeType: S }
+          - { AttributeName: updatedAt, AttributeType: N }
         KeySchema:
           - { AttributeName: pk, KeyType: HASH }
           - { AttributeName: sk, KeyType: RANGE }
@@ -94,6 +95,11 @@ resources:
               - { AttributeName: userId, KeyType: HASH }
               - { AttributeName: pk, KeyType: RANGE }
             Projection: { ProjectionType: KEYS_ONLY }
+          - IndexName: ConversationsByUserUpdatedAt
+            KeySchema:
+              - { AttributeName: pk, KeyType: HASH }
+              - { AttributeName: updatedAt, KeyType: RANGE }
+            Projection: { ProjectionType: ALL }
     ChatMedia:
       Type: AWS::S3::Bucket
       Properties:

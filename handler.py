@@ -37,6 +37,7 @@ cleanup_lambda = boto3.client('lambda')
 push_lambda = boto3.client('lambda')
 secrets = boto3.client('secretsmanager')
 _fcm_credentials = None
+CONVERSATION_PAGE_SIZE = 25
 
 
 def now():
@@ -122,9 +123,35 @@ def authenticate(connection, body):
     return {'userId': user_id}
 
 
-def conversations(user):
-    result = ddb.query(KeyConditionExpression=Key('pk').eq(f'USER#{user}') & Key('sk').begins_with('CONV#'), ConsistentRead=True)
-    return {'conversations': [clean(item) for item in result['Items']]}
+def conversations(user, body):
+    query = {
+        'IndexName': 'ConversationsByUserUpdatedAt',
+        'KeyConditionExpression': Key('pk').eq(f'USER#{user}'),
+        'ScanIndexForward': False,
+        'Limit': CONVERSATION_PAGE_SIZE,
+    }
+    cursor = body.get('cursor')
+    if cursor is not None:
+        if (
+            not isinstance(cursor, dict)
+            or cursor.get('pk') != f'USER#{user}'
+            or not isinstance(cursor.get('sk'), str)
+            or not cursor['sk'].startswith('CONV#')
+            or type(cursor.get('updatedAt')) is not int
+        ):
+            raise ValueError('Invalid conversation cursor.')
+        query['ExclusiveStartKey'] = {key: cursor[key] for key in ('pk', 'sk', 'updatedAt')}
+    result = ddb.query(**query)
+    response = {
+        'conversations': [clean(item) for item in result['Items']],
+        'nextCursor': clean(result.get('LastEvaluatedKey')),
+    }
+    active_id = body.get('activeConversation')
+    if active_id is not None:
+        if not isinstance(active_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,2000}', active_id):
+            raise ValueError('Invalid active conversation.')
+        response['activeConversation'] = clean(member(active_id, user))
+    return response
 
 
 def set_conversation_mute(user, body):
@@ -645,7 +672,7 @@ def action(event, _context):
             user = socket_user(connection)
             if route in ('createConversation', 'addGroupMember', 'createGroupInvite', 'acceptGroupInvite', 'mediaUpload', 'send', 'react') or (route == 'removeGroupMember' and body.get('userId') != user):
                 ensure_chat_allowed(user)
-            routes = {'conversations': lambda: conversations(user), 'createConversation': lambda: create_conversation(user, body), 'addGroupMember': lambda: group_membership(user, body, True), 'removeGroupMember': lambda: group_membership(user, body, False), 'createGroupInvite': lambda: create_group_invite(user, body), 'previewGroupInvite': lambda: group_invite(user, body, False), 'acceptGroupInvite': lambda: group_invite(user, body, True), 'history': lambda: history(user, body), 'markRead': lambda: mark_read(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'setMute': lambda: set_conversation_mute(user, body), 'report': lambda: report(user, body), 'registerPush': lambda: register_push(user, body, True), 'unregisterPush': lambda: register_push(user, body, False)}
+            routes = {'conversations': lambda: conversations(user, body), 'createConversation': lambda: create_conversation(user, body), 'addGroupMember': lambda: group_membership(user, body, True), 'removeGroupMember': lambda: group_membership(user, body, False), 'createGroupInvite': lambda: create_group_invite(user, body), 'previewGroupInvite': lambda: group_invite(user, body, False), 'acceptGroupInvite': lambda: group_invite(user, body, True), 'history': lambda: history(user, body), 'markRead': lambda: mark_read(user, body), 'mediaUpload': lambda: media_upload(user, body), 'send': lambda: send(user, body), 'react': lambda: react(user, body), 'setMute': lambda: set_conversation_mute(user, body), 'report': lambda: report(user, body), 'registerPush': lambda: register_push(user, body, True), 'unregisterPush': lambda: register_push(user, body, False)}
             if route not in routes:
                 raise ValueError('Unknown chat action.')
             data = routes[route]()
