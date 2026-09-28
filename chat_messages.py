@@ -18,13 +18,56 @@ def history(user, body):
     if not member(conversation, user):
         raise ValueError('Conversation not found.')
     cursor = body.get('cursor')
+    after = body.get('after')
     if cursor is not None and (not isinstance(cursor, str) or not re.fullmatch(r'MSG#\d{13}#[a-f0-9]{32}', cursor)):
         raise ValueError('Invalid message cursor.')
-    query = {'KeyConditionExpression': Key('pk').eq(f'CONV#{conversation}') & Key('sk').begins_with('MSG#'), 'ScanIndexForward': False, 'Limit': 50}
-    if cursor:
-        query['ExclusiveStartKey'] = {'pk': f'CONV#{conversation}', 'sk': cursor}
-    result = ddb.query(**query)
-    return {'conversation': conversation, 'messages': [public_message(item) for item in reversed(result['Items'])], 'nextCursor': result.get('LastEvaluatedKey', {}).get('sk')}
+    if after is not None and (not isinstance(after, str) or not re.fullmatch(r'MSG#\d{13}#[a-f0-9]{32}', after)):
+        raise ValueError('Invalid message position.')
+    if cursor and after:
+        raise ValueError('Choose either an older or newer message position.')
+
+    refresh_media = body.get('refreshMedia', [])
+    if not isinstance(refresh_media, list) or len(refresh_media) > 100 or any(
+        not isinstance(key, str) or not re.fullmatch(r'MSG#\d{13}#[a-f0-9]{32}', key)
+        for key in refresh_media
+    ):
+        raise ValueError('Invalid media refresh request.')
+
+    query = None
+    if after:
+        query = {
+            'KeyConditionExpression': Key('pk').eq(f'CONV#{conversation}') & Key('sk').gt(after),
+            'ScanIndexForward': True,
+            'Limit': 50,
+        }
+    elif cursor:
+        query = {
+            'KeyConditionExpression': Key('pk').eq(f'CONV#{conversation}') & Key('sk').lt(cursor),
+            'ScanIndexForward': False,
+            'Limit': 50,
+        }
+    elif not refresh_media:
+        query = {'KeyConditionExpression': Key('pk').eq(f'CONV#{conversation}') & Key('sk').begins_with('MSG#'), 'ScanIndexForward': False, 'Limit': 50}
+    result = ddb.query(**query) if query else {'Items': []}
+    messages = [public_message(item) for item in result['Items']]
+    if not after:
+        messages.reverse()
+    response = {
+        'conversation': conversation,
+        'messages': messages,
+        'nextCursor': result.get('LastEvaluatedKey', {}).get('sk') if not after else None,
+    }
+    if after:
+        response['newerCursor'] = result.get('LastEvaluatedKey', {}).get('sk')
+    if refresh_media:
+        response['mediaUrls'] = {
+            key: public_message(item)['url']
+            for key in refresh_media
+            if (item := ddb.get_item(Key={'pk': f'CONV#{conversation}', 'sk': key}).get('Item'))
+            and item.get('kind') in ('image', 'video')
+            and item.get('key')
+        }
+    return response
 
 def mark_read(user, body):
     conversation = str(body.get('conversation', ''))
