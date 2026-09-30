@@ -51,8 +51,9 @@ def notification_preview(kind, text):
 
 def send_push_notifications(user, conversation, event):
     try:
-        conversation_record = member(conversation, user)
-        if conversation_record and conversation_record.get('muted') is True:
+        friend_request = event.get('type') == 'friendRequest'
+        conversation_record = None if friend_request else member(conversation, user)
+        if not friend_request and conversation_record and conversation_record.get('muted') is True:
             print(f'Push delivery skipped for muted conversation {conversation}.')
             return
         access_token, project = fcm_access_token()
@@ -63,19 +64,20 @@ def send_push_notifications(user, conversation, event):
         preview = notification_preview(event.get('kind'), event.get('text', ''))
         sender_name = str(event.get('senderName') or '').strip()
         is_group = bool(event.get('group'))
-        title = str(event.get('groupTitle') or '').strip() if is_group else sender_name
+        title = 'Friend request' if friend_request else (str(event.get('groupTitle') or '').strip() if is_group else sender_name)
         if not title:
             title = 'New message'
         is_mentioned = user in event.get('mentions', [])
-        body = f'{sender_name}: {preview}' if is_group and sender_name else preview
+        body = f'{sender_name} sent you a friend request.' if friend_request else (f'{sender_name}: {preview}' if is_group and sender_name else preview)
+        destination = '/friends/' if friend_request else f'/chat/?conversation={conversation}'
         for device in devices:
-            device_body = f'{sender_name} mentioned you: {preview}' if is_mentioned and sender_name else body
+            device_body = f'{sender_name} mentioned you: {preview}' if not friend_request and is_mentioned and sender_name else body
             payload = json.dumps({'message': {
                 'token': device['token'],
                 'notification': {'title': title, 'body': device_body},
-                'data': {'conversationId': conversation, 'url': f'/chat/?conversation={conversation}'},
-                'webpush': {'data': {'conversationId': conversation}, 'fcm_options': {'link': f"{os.environ['WEB_APP_URL'].rstrip('/')}/chat/?conversation={conversation}"} if os.environ.get('WEB_APP_URL') else {}, 'notification': {'icon': '/app-icon.svg', 'tag': f'chat-{conversation}'}},
-                'android': {'notification': {'channel_id': 'messages', 'tag': f'chat-{conversation}'}},
+                'data': {'conversationId': '' if friend_request else conversation, 'url': destination, 'type': 'friendRequest' if friend_request else 'chat'},
+                'webpush': {'data': {'conversationId': '' if friend_request else conversation, 'url': destination}, 'fcm_options': {'link': f"{os.environ['WEB_APP_URL'].rstrip('/')}{destination}"} if os.environ.get('WEB_APP_URL') else {}, 'notification': {'icon': '/app-icon.svg', 'tag': f'friend-{user}' if friend_request else f'chat-{conversation}'}},
+                'android': {'notification': {'channel_id': 'messages', 'tag': f'friend-{user}' if friend_request else f'chat-{conversation}'}},
             }}).encode()
             request = Request(f'https://fcm.googleapis.com/v1/projects/{project}/messages:send', data=payload, headers={'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}, method='POST')
             try:

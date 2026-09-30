@@ -1,5 +1,7 @@
 # Chat service
 
+Friend requests use the push Lambda already deployed with this service. After deploying this version, set `CHAT_PUSH_FUNCTION_NAME` in the admin environment to the stage's push Lambda name and grant the admin runtime `lambda:InvokeFunction` on it. New incoming requests notify recipients who opted in to push and open `/friends/`; conversation mute settings do not suppress these request alerts. The in-app request badge is available even without push permission.
+
 Requires AWS CLI, Node.js 22+, Serverless Framework v4, and credentials that can deploy Lambda, DynamoDB, S3, and API Gateway integrations. The existing API must be a WebSocket API with route selection expression `$request.body.action`.
 
 Run from PowerShell:
