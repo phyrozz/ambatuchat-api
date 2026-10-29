@@ -4,9 +4,12 @@ param(
   [Parameter(Mandatory = $true)][string]$PlayerPoolId,
   [string]$Stage = 'prod',
   [string]$AwsProfile = '',
-  [switch]$CreateApi
+  [switch]$CreateApi,
+  [double]$ThrottleRate = 100,
+  [int]$ThrottleBurst = 200
 )
 $ErrorActionPreference = 'Stop'
+if ($ThrottleRate -le 0 -or $ThrottleBurst -le 0) { throw 'ThrottleRate and ThrottleBurst must be positive.' }
 if ($CreateApi -and $ApiId) { throw 'Use either -ApiId or -CreateApi, not both.' }
 if (-not $CreateApi -and -not $ApiId) { throw 'Pass -ApiId or use -CreateApi to create a dedicated WebSocket API.' }
 if ($CreateApi -and $Stage -eq 'prod') { throw '-CreateApi is intended for a non-production stage.' }
@@ -67,6 +70,9 @@ if (-not $configuredStage) {
   aws apigatewayv2 create-stage --api-id $ApiId --stage-name $Stage --auto-deploy --region $Region | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "Could not create the $Stage stage." }
 }
+$rateText = $ThrottleRate.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+aws apigatewayv2 update-stage --api-id $ApiId --stage-name $Stage --default-route-settings "ThrottlingRateLimit=$rateText,ThrottlingBurstLimit=$ThrottleBurst" --region $Region | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Could not set default route throttling for $Stage." }
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Push-Location $root
 try {

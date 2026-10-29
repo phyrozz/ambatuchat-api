@@ -15,6 +15,7 @@ from chat_notifications import (
     register_push,
     send_push_notifications,
 )
+from chat_rate_limit import check_rate_limit
 from chat_reactions import react
 from chat_runtime import (
     clean,
@@ -53,6 +54,7 @@ def action(event, _context):
             data = authenticate(connection, body)
         else:
             user = socket_user(connection)
+            check_rate_limit(user, route)
             restricted_routes = {
                 'createConversation', 'addGroupMember', 'createGroupInvite',
                 'acceptGroupInvite', 'mediaUpload', 'send', 'react',

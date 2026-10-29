@@ -5,6 +5,7 @@ package:
   patterns:
     - '!node_modules/**'
     - '!__pycache__/**'
+    - '!tests/**'
     - '!*.md'
     - '!*.ps1'
     - '!package*.json'
@@ -111,7 +112,7 @@ resources:
         CorsConfiguration:
           CorsRules:
             - AllowedHeaders: ['*']
-              AllowedMethods: [PUT, GET]
+              AllowedMethods: [POST, PUT, GET]
               AllowedOrigins: ['*']
               MaxAge: 300
   Outputs:

@@ -102,8 +102,13 @@ def media_upload(user, body):
     if content_type not in allowed or type(size) is not int or not 0 < size <= 5 * 1024 * 1024:
         raise ValueError('Choose an image or video under 5 MB.')
     key = f'chat/{user}/{uuid.uuid4().hex}'
-    url = s3.generate_presigned_url('put_object', Params={'Bucket': bucket, 'Key': key, 'ContentType': content_type}, ExpiresIn=300)
-    return {'key': key, 'uploadUrl': url, 'contentType': content_type}
+    upload = s3.generate_presigned_post(
+        Bucket=bucket, Key=key,
+        Fields={'Content-Type': content_type},
+        Conditions=[{'Content-Type': content_type}, ['content-length-range', 1, size]],
+        ExpiresIn=300,
+    )
+    return {'key': key, 'uploadUrl': upload['url'], 'uploadFields': upload['fields']}
 
 def send(user, body):
     conversation = str(body.get('conversation', ''))
