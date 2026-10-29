@@ -165,7 +165,7 @@ def send(user, body):
             if socket['pk'].startswith('CONN#'):
                 push(socket['pk'][5:], {'event': 'message', 'message': message})
     recipients = [recipient for recipient in membership['members'] if recipient != user]
-    fcm_configured = bool(os.environ.get('FCM_PROJECT_ID') and os.environ.get('FCM_SECRET_ARN'))
+    fcm_configured = bool(os.environ.get('FCM_PROJECT_ID') and os.environ.get('FCM_PARAMETER_NAME'))
     if recipients and fcm_configured:
         names = membership.get('names', {})
         push_lambda.invoke(

@@ -28,7 +28,7 @@ SOUND_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 bucket = os.environ['CHAT_BUCKET']
 cleanup_lambda = boto3.client('lambda')
 push_lambda = boto3.client('lambda')
-secrets = boto3.client('secretsmanager')
+ssm = boto3.client('ssm')
 CONVERSATION_PAGE_SIZE = 25
 
 

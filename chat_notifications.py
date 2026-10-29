@@ -7,7 +7,7 @@ from urllib.request import Request, urlopen
 
 from boto3.dynamodb.conditions import Key
 
-from chat_runtime import ddb, member, now, secrets
+from chat_runtime import ddb, member, now, ssm
 
 _fcm_credentials = None
 
@@ -27,11 +27,11 @@ def register_push(user, body, adding):
 def fcm_access_token():
     global _fcm_credentials
     if not _fcm_credentials:
-        arn = os.environ.get('FCM_SECRET_ARN')
+        parameter = os.environ.get('FCM_PARAMETER_NAME')
         project = os.environ.get('FCM_PROJECT_ID')
-        if not arn or not project:
+        if not parameter or not project:
             return None, None
-        secret = json.loads(secrets.get_secret_value(SecretId=arn)['SecretString'])
+        secret = json.loads(ssm.get_parameter(Name=parameter, WithDecryption=True)['Parameter']['Value'])
         from google.auth.transport.requests import Request as GoogleRequest
         from google.oauth2 import service_account
         _fcm_credentials = service_account.Credentials.from_service_account_info(secret, scopes=['https://www.googleapis.com/auth/firebase.messaging'])

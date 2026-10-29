@@ -47,9 +47,19 @@ Push tokens are stored in the existing chat table under `PUSH#<Cognito sub>` aft
 Configure Firebase Cloud Messaging before deploying:
 
 1. Create a Firebase project and enable the Firebase Cloud Messaging API. Register Android and iOS apps using the app's bundle/application ID (`com.example.ambatuapp` in the current Capacitor config). Download `google-services.json` to `revamp/android/app/` and add `GoogleService-Info.plist` to the iOS App target in Xcode.
-2. In Firebase project settings, create a service account with the Firebase Cloud Messaging API Admin role. Store the downloaded service-account JSON as an AWS Secrets Manager secret named `ambatu-chat/prod/fcm` (or the matching stage). Do not commit either service-account file.
+2. In Firebase project settings, create a service account with the Firebase Cloud Messaging API Admin role. Store its JSON in a standard AWS Systems Manager Parameter Store `SecureString` named `/ambatu-chat/prod/fcm` (or replace `prod` with the deployment stage), using the default AWS managed `aws/ssm` key. The compact JSON must fit the 4096-byte standard parameter limit. Do not commit the service-account file. For an existing Secrets Manager secret, use the migration procedure below.
 3. Upload an APNs authentication key in Firebase project settings for iOS delivery. Enable Push Notifications for the iOS App ID and use a physical iOS device for testing.
 4. For web push, add the deployed website hostname to Firebase's authorized domains and generate a Web Push certificate key pair. Add the Firebase web app config and public VAPID key to `revamp/.env.local` using the `NEXT_PUBLIC_FIREBASE_*` variables in `revamp/.env.example`. Set `NEXT_PUBLIC_APP_URL` to the HTTPS origin used by the website.
-5. Set `FCM_PROJECT_ID`, `FCM_SECRET_ARN` (the Secrets Manager ARN), and `WEB_APP_URL` in the shell used for `deploy.ps1`, then deploy chat-service. Set the same Firebase web app config in the production web build environment and rebuild the web/native app.
+5. Set `FCM_PROJECT_ID` and `WEB_APP_URL` in the shell used for `deploy.ps1`, then deploy chat-service. The parameter name is set automatically from the stage. Set the same Firebase web app config in the production web build environment and rebuild the web/native app.
 
-The service account JSON is read at runtime from Secrets Manager. The deployment role needs Docker to build the Python `google-auth` and `requests` dependencies for the Lambda's Linux ARM64 runtime. Configure all app credentials before running `npm run cap:sync`; then install the rebuilt app and tap the bell in Ambatuchat to grant permission and register that device. Web push requires HTTPS. On iOS web, visitors must add the site to their Home Screen before enabling notifications.
+The service account JSON is decrypted from Parameter Store at runtime and cached in each warm Lambda environment. The deployment role needs Docker to build the Python `google-auth` and `requests` dependencies for the Lambda's Linux ARM64 runtime. Configure all app credentials before running `npm run cap:sync`; then install the rebuilt app and tap the bell in Ambatuchat to grant permission and register that device. Web push requires HTTPS. On iOS web, visitors must add the site to their Home Screen before enabling notifications.
+
+### Migrate an existing FCM secret
+
+Before deploying this version, install `boto3` in a local Python environment and run the following from `chat-service` with an AWS profile authorized to read the existing secret and create an SSM parameter. Use the same region, account, and stage as the chat deployment:
+
+```powershell
+python migrate_fcm_parameter.py --region ap-southeast-1 --stage prod --profile YOUR_PROFILE
+```
+
+Use `--secret-id` if the existing secret has a different name. The script copies the JSON directly between AWS services through memory, compacts it to fit the standard tier, and refuses to overwrite an existing parameter. It does not delete the original secret. Deploy with `FCM_PROJECT_ID` and `WEB_APP_URL` still set, then test message and friend-request push delivery and check the push Lambda logs. Once verified, review the old secret and any other consumers before scheduling its deletion; Secrets Manager charges continue until it is deleted. Repeat for each deployed stage. For a custom KMS key, the Lambda role and key policy must also permit `kms:Decrypt`.
